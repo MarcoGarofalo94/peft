@@ -34,11 +34,11 @@ from .dora import DoraConv2dLayer, DoraConv3dLayer, DoraEmbeddingLayer, DoraLine
 
 class LoraLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
-    adapter_layer_names = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
+    adapter_layer_names = ("lora_A", "lora_B","lora_V", "lora_embedding_A", "lora_embedding_B", "lora_embedding_V")
     # All names of other parameters that may contain adapter-related parameters
     other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout")
 
-    def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, **kwargs) -> None:
+    def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, test: bool = True, **kwargs) -> None:
         self.base_layer = base_layer
         self.r = {}
         self.lora_alpha = {}
@@ -46,9 +46,15 @@ class LoraLayer(BaseTunerLayer):
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
+        self.test = test
+        if test:
+            self.lora_V = nn.ModuleDict({})
+        
         # For Embedding layer
         self.lora_embedding_A = nn.ParameterDict({})
         self.lora_embedding_B = nn.ParameterDict({})
+        if test:
+            self.lora_embedding_V = nn.ParameterDict({})
         # Mark the weight as unmerged
         self._disable_adapters = False
         self.merged_adapters = []
@@ -156,7 +162,17 @@ class LoraLayer(BaseTunerLayer):
             if init_lora_weights is True:
                 # initialize A the same way as the default for nn.Linear and B to zero
                 # https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L124
-                nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                if self.test:
+                    #Use SVD on weight matrix and initialize A with V
+                    weight = self.get_base_layer().weight
+                    weight = transpose(weight, self.fan_in_fan_out)
+                    U, S, V = torch.linalg.svd(weight.data, full_matrices=False)
+                    Vr = V[:, : self.r[adapter_name]]
+                    Sr = S[: self.r[adapter_name]]
+                    Sr /= self.scaling[adapter_name]
+                    self.lora_A[adapter_name].weight.data = Vr
+                else:
+                    nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
             elif init_lora_weights.lower() == "gaussian":
                 nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
             else:
@@ -165,7 +181,17 @@ class LoraLayer(BaseTunerLayer):
         if adapter_name in self.lora_embedding_A.keys():
             # Initialize A to zeros and B the same way as the default for nn.Embedding, see:
             # https://github.com/microsoft/LoRA/blob/4c0333854cb905966f8cc4e9a74068c1e507c7b7/loralib/layers.py#L59-L60
-            nn.init.zeros_(self.lora_embedding_A[adapter_name])
+            if self.test:
+                #Use SVD on weight matrix and initialize A with V
+                weight = self.get_base_layer().weight
+                weight = transpose(weight, self.fan_in_fan_out)
+                U, S, V = torch.linalg.svd(weight.data, full_matrices=False)
+                Vr = V[:, : self.r[adapter_name]]
+                Sr = S[: self.r[adapter_name]]
+                Sr /= self.scaling[adapter_name]
+                self.lora_embedding_A[adapter_name].weight.data = Vr
+            else:
+                nn.init.zeros_(self.lora_embedding_A[adapter_name])
             nn.init.normal_(self.lora_embedding_B[adapter_name])
 
     def olora_init(self, adapter_name):
