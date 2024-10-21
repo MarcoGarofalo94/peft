@@ -11,9 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-#Adding V version
-
 from __future__ import annotations
 
 import math
@@ -34,14 +31,15 @@ from peft.utils.other import transpose
 from .config import LoraConfig
 from .dora import DoraConv2dLayer, DoraConv3dLayer, DoraEmbeddingLayer, DoraLinearLayer, _DoraConvNdLayer
 
+import datetime
 
 class LoraLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
-    adapter_layer_names = ("lora_A", "lora_B","lora_V", "lora_embedding_A", "lora_embedding_B", "lora_embedding_V") #V
+    adapter_layer_names = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
     # All names of other parameters that may contain adapter-related parameters
     other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout")
 
-    def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, **kwargs) -> None:
+    def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, test: bool = True, **kwargs) -> None:
         self.base_layer = base_layer
         self.r = {}
         self.lora_alpha = {}
@@ -49,13 +47,15 @@ class LoraLayer(BaseTunerLayer):
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
-        self.US_r = nn.ModuleDict({})
-        self.lora_V = nn.ModuleDict({}) # V
+        self.test = test
+        if test:
+            self.lora_V = nn.ModuleDict({})
         
         # For Embedding layer
         self.lora_embedding_A = nn.ParameterDict({})
         self.lora_embedding_B = nn.ParameterDict({})
-        self.lora_embedding_V = nn.ParameterDict({}) #V
+        if test:
+            self.lora_embedding_V = nn.ParameterDict({})
         # Mark the weight as unmerged
         self._disable_adapters = False
         self.merged_adapters = []
@@ -127,8 +127,6 @@ class LoraLayer(BaseTunerLayer):
         # Actual trainable parameters
         self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
         self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
-        self.lora_V[adapter_name] = nn.Linear(self.in_features, r, bias=False) # V
-
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
         else:
@@ -145,7 +143,7 @@ class LoraLayer(BaseTunerLayer):
             with gather_params_ctx(self.get_base_layer().weight):
                 self.loftq_init(adapter_name)
         elif init_lora_weights:
-            self.reset_lora_parameters(adapter_name, init_lora_weights) #Initializing LoRA Params
+            self.reset_lora_parameters(adapter_name, init_lora_weights)
         # call this before dora_init
         self._move_adapter_to_device_of_base_layer(adapter_name)
 
@@ -157,25 +155,29 @@ class LoraLayer(BaseTunerLayer):
 
         self.set_adapter(self.active_adapters)
 
-    def reset_lora_parameters(self, adapter_name, init_lora_weights): #actuali initialization of LoRA
+    def reset_lora_parameters(self, adapter_name, init_lora_weights):
         if init_lora_weights is False:
             return
-
+        # print('init: ', init_lora_weights)
         if adapter_name in self.lora_A.keys():
             if init_lora_weights is True:
                 # initialize A the same way as the default for nn.Linear and B to zero
                 # https://github.com/microsoft/LoRA/blob/a0a92e0f26c067cf94747bdbf1ce73793fa44d19/loralib/layers.py#L124
-
-                    #Use SVD on weight matrix and initialize V
+                if self.test:
+                    #Use SVD on weight matrix and initialize A with V
                     weight = self.get_base_layer().weight
                     weight = transpose(weight, self.fan_in_fan_out)
                     U, S, V = torch.linalg.svd(weight.data, full_matrices=False)
                     Vr = V[:, : self.r[adapter_name]]
                     Sr = S[: self.r[adapter_name]]
                     Sr /= self.scaling[adapter_name]
-                    self.lora_V[adapter_name].weight.data = Vr
+                    # print('adapter_name: ',adapter_name)
+                    # print("A: ",self.lora_A[adapter_name].weight.data.shape)
+                    self.lora_A[adapter_name].weight.data = Vr.T.clone().detach().requires_grad_(True)
+                    # print('Vr: ' ,Vr.shape)
+                    
+                else:
                     nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
-
             elif init_lora_weights.lower() == "gaussian":
                 nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
             else:
@@ -184,16 +186,17 @@ class LoraLayer(BaseTunerLayer):
         if adapter_name in self.lora_embedding_A.keys():
             # Initialize A to zeros and B the same way as the default for nn.Embedding, see:
             # https://github.com/microsoft/LoRA/blob/4c0333854cb905966f8cc4e9a74068c1e507c7b7/loralib/layers.py#L59-L60
-
-            # weight = self.get_base_layer().weight
-            # weight = transpose(weight, self.fan_in_fan_out)
-            # U, S, V = torch.linalg.svd(weight.data, full_matrices=False)
-            # Vr = V[:, : self.r[adapter_name]]
-            # Sr = S[: self.r[adapter_name]]
-            # Sr /= self.scaling[adapter_name]
-            # self.lora_V[adapter_name].weight.data = Vr
-            
-            nn.init.zeros_(self.lora_embedding_A[adapter_name])
+            if self.test:
+                #Use SVD on weight matrix and initialize A with V
+                weight = self.get_base_layer().weight
+                weight = transpose(weight, self.fan_in_fan_out)
+                U, S, V = torch.linalg.svd(weight.data, full_matrices=False)
+                Vr = V[:, : self.r[adapter_name]]
+                Sr = S[: self.r[adapter_name]]
+                Sr /= self.scaling[adapter_name]
+                self.lora_embedding_A[adapter_name].weight.data = Vr
+            else:
+                nn.init.zeros_(self.lora_embedding_A[adapter_name])
             nn.init.normal_(self.lora_embedding_B[adapter_name])
 
     def olora_init(self, adapter_name):
@@ -446,7 +449,7 @@ class Linear(nn.Module, LoraLayer):
         self.fan_in_fan_out = fan_in_fan_out
 
         self._active_adapter = adapter_name
-        self.update_layer( #update layer with LoRA ones
+        self.update_layer(
             adapter_name,
             r,
             lora_alpha=lora_alpha,
@@ -470,7 +473,6 @@ class Linear(nn.Module, LoraLayer):
                 The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
                 to `None`.
         """
-        print('Merging')
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
             # no adapter to merge
@@ -561,7 +563,6 @@ class Linear(nn.Module, LoraLayer):
             adapter (str):
                 The name of the adapter for which the delta weight should be computed.
         """
-        print('Getting Delta Weight')
         device = self.lora_B[adapter].weight.device
         dtype = self.lora_B[adapter].weight.dtype
 
@@ -572,12 +573,10 @@ class Linear(nn.Module, LoraLayer):
 
         weight_A = self.lora_A[adapter].weight
         weight_B = self.lora_B[adapter].weight
-        weight_V = self.lora_V[adapter].weight
 
         if cast_to_fp32:
             weight_A = weight_A.float()
             weight_B = weight_B.float()
-            weight_V = weight_V.float()
 
         output_tensor = transpose(weight_B @ weight_A, self.fan_in_fan_out) * self.scaling[adapter]
 
@@ -602,7 +601,7 @@ class Linear(nn.Module, LoraLayer):
             result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
-        else: #goes here
+        else:
             result = self.base_layer(x, *args, **kwargs)
             torch_result_dtype = result.dtype
             for active_adapter in self.active_adapters:
@@ -610,7 +609,6 @@ class Linear(nn.Module, LoraLayer):
                     continue
                 lora_A = self.lora_A[active_adapter]
                 lora_B = self.lora_B[active_adapter]
-                lora_V = self.lora_V[active_adapter]
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
                 x = x.to(lora_A.weight.dtype)
