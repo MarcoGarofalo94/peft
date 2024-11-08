@@ -1,3 +1,6 @@
+result-distilbert-lora/
+result-distilbert-slora-only-mag/
+sst2-result-distilbert-slora-only-mag/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

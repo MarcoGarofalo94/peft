@@ -34,10 +34,111 @@ from peft.utils.other import transpose
 from .config import LoraConfig
 from .dora import DoraConv2dLayer, DoraConv3dLayer, DoraEmbeddingLayer, DoraLinearLayer, _DoraConvNdLayer
 
+use_S = False
+use_variant_init_S= False
+class DiagonalActivation(nn.Module):
+    def forward(self, x):
+        """
+        Forward pass of diagonal activation
+        Args:
+            x: Input tensor
+        Returns:
+            Tensor with only diagonal elements preserved
+        """
+        # Create a diagonal mask
+        mask = torch.eye(x.shape[-2], x.shape[-1], device=x.device)
+        
+        # For batched inputs, expand mask to match input dimensions
+        if x.dim() > 2:
+            mask = mask.view(*([1] * (x.dim() - 2)), *mask.shape)
+            mask = mask.expand_as(x)
+            
+        return x * mask
+
+class SLayer(nn.Module):
+    def __init__(self):
+        """
+        Initialize layer from an existing diagonal matrix's diagonal values.
+        
+        Args:
+            diagonal_matrix (torch.Tensor): Input diagonal matrix to initialize from
+            learn_direction (bool): Whether to learn the direction of the diagonal vector
+            learn_magnitude (bool): Whether to learn the magnitude scaling
+        """
+        super().__init__()
+        
+    def set_s(self,diagonal_matrix, learn_direction=True, learn_magnitude=True):
+        # Extract the diagonal values
+        init_diagonal = torch.diag(diagonal_matrix)
+        self.init_magnitude = torch.norm(init_diagonal)
+        self.init_direction = init_diagonal / self.init_magnitude
+        
+        # Initialize parameters based on learning configuration
+        if learn_direction:
+            self.direction = nn.Parameter(self.init_direction)
+        else:
+            self.register_buffer('direction', self.init_direction)
+            
+        if learn_magnitude:
+            self.magnitude = nn.Parameter(torch.tensor([self.init_magnitude]))
+        else:
+            self.register_buffer('magnitude', torch.tensor([self.init_magnitude]))
+        
+
+    
+    def forward(self, x):
+        """
+        Forward pass: converts diagonal vector to matrix and applies transformation.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, n)
+            
+        Returns:
+            torch.Tensor: Transformed input using diagonal matrix
+        """
+        # print('direction: ',self.direction)
+        # print('magnitude: ',self.magnitude)
+        # print("direction: ",self.direction, "initial: ",self.init_direction)
+        # print("magnitude: ",self.magnitude, "initial: ", self.init_magnitude)
+            
+        # Normalize direction and scale by magnitude
+        normalized_direction = F.normalize(self.direction, dim=0)
+        diagonal = normalized_direction * self.magnitude
+        
+        # Create diagonal matrix for transformation
+        diag_matrix = torch.diag(diagonal)
+        
+        return torch.matmul(x, diag_matrix)
+    
+    @property
+    def diagonal_matrix(self):
+        """
+        Property to get current diagonal matrix.
+        """
+        normalized_direction = F.normalize(self.direction, dim=0)
+        diagonal = normalized_direction * self.magnitude
+        return torch.diag(diagonal)
+    
+    @property
+    def diagonal_vector(self):
+        """
+        Property to get current diagonal vector.
+        """
+        normalized_direction = F.normalize(self.direction, dim=0)
+        return normalized_direction * self.magnitude
 
 class LoraLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
-    adapter_layer_names = ("lora_A", "lora_B","lora_V", "lora_embedding_A", "lora_embedding_B", "lora_embedding_V") #V
+    if use_S:
+        adapter_layer_names = ("lora_S","lora_A","lora_B", "lora_embedding_A", "lora_embedding_B",) #V
+    else:
+        adapter_layer_names = ("lora_A","lora_B", "lora_embedding_A", "lora_embedding_B",) #V
+
+    # adapter_layer_names = ("lora_A","lora_B", "lora_embedding_A", "lora_embedding_B",) #V
+    # if 'lora_A' not in adapter_layer_names:
+    #     print('lora0')
+    # else:
+    #     print('lora_A')
     # All names of other parameters that may contain adapter-related parameters
     other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout")
 
@@ -49,13 +150,15 @@ class LoraLayer(BaseTunerLayer):
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
-        self.US_r = nn.ModuleDict({})
-        self.lora_V = nn.ModuleDict({}) # V
+        if use_S:
+            self.lora_S = nn.ModuleDict({})
+        # self.lora_V = nn.ModuleDict({}) # V
         
         # For Embedding layer
         self.lora_embedding_A = nn.ParameterDict({})
         self.lora_embedding_B = nn.ParameterDict({})
-        self.lora_embedding_V = nn.ParameterDict({}) #V
+        if use_S:
+            self.lora_embedding_S = nn.ParameterDict({}) #V
         # Mark the weight as unmerged
         self._disable_adapters = False
         self.merged_adapters = []
@@ -123,11 +226,20 @@ class LoraLayer(BaseTunerLayer):
         else:
             lora_dropout_layer = nn.Identity()
 
+        
+
         self.lora_dropout.update(nn.ModuleDict({adapter_name: lora_dropout_layer}))
         # Actual trainable parameters
         self.lora_A[adapter_name] = nn.Linear(self.in_features, r, bias=False)
         self.lora_B[adapter_name] = nn.Linear(r, self.out_features, bias=False)
-        self.lora_V[adapter_name] = nn.Linear(self.in_features, r, bias=False) # V
+        # self.lora_V[adapter_name] = nn.Linear(self.in_features, r, bias=False) # V
+        if use_S:
+            # self.lora_S[adapter_name] = nn.Linear(r, r, bias=False) # V
+            self.lora_S[adapter_name] = SLayer()
+
+        #Frozen params
+        # self.US_r[adapter_name] = nn.Linear(r, self.out_features,bias=False)
+        # self.US_r[adapter_name].requires_grad_(False)
 
         if use_rslora:
             self.scaling[adapter_name] = lora_alpha / math.sqrt(r)
@@ -169,18 +281,55 @@ class LoraLayer(BaseTunerLayer):
                     #Use SVD on weight matrix and initialize V
                     weight = self.get_base_layer().weight
                     weight = transpose(weight, self.fan_in_fan_out)
-                    U, S, V = torch.linalg.svd(weight.data, full_matrices=False)
-                    Vr = V[:, : self.r[adapter_name]]
-                    Sr = S[: self.r[adapter_name]]
-                    Sr /= self.scaling[adapter_name]
-                    self.lora_V[adapter_name].weight.data = Vr
-                    nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                    dtype = weight.dtype
+                    # Ur = U[:,:self.r[adapter_name]]
+                    # Vr: torch.Tensor = V[:, : self.r[adapter_name]]
+                    # Sr /= self.scaling[adapter_name]
+                    # self.lora_V[adapter_name].weight.data = Vr.T
+                    # self.US_r[adapter_name].weight.data = (Ur@torch.diag(Sr))
+                    # self.US_r.requires_grad_(False)
+                    if use_S:
+                        U, S, V = torch.linalg.svd(weight.data, full_matrices=False)
+                        Ur = U[:,:self.r[adapter_name]]
+                        Sr = torch.diag(S[: self.r[adapter_name]])
+                        Vr: torch.Tensor = V[:, : self.r[adapter_name]]
+                        if use_variant_init_S:
+                            self.lora_S[adapter_name].weight.data = Sr.clone().detach().requires_grad_(True)
+                            # nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                            # self.lora_S[adapter_name].set_s(torch.diag(Sr),learn_direction=False)
+                            # self.lora_A[adapter_name].weight.data = Vr.T.clone().detach().requires_grad_(True)
+                            # self.lora_B[adapter_name].weight.data = Ur.clone().detach().requires_grad_(True)
+                            nn.init.kaiming_uniform_(self.lora_B[adapter_name].weight, a=math.sqrt(5))
+                            
+                            nn.init.zeros_(self.lora_A[adapter_name].weight)
+                            # lora_A = self.lora_A[adapter_name].weight.data
+                            # lora_B = self.lora_B[adapter_name].weight.data
+                            # lora_S = self.lora_S[adapter_name].weight.data
+                            # print((lora_B@lora_S).shape)
+                            # weight = weight.data - self.scaling[adapter_name] * lora_B@lora_S@lora_A
+                            # weight = transpose(weight.to(dtype), self.fan_in_fan_out)
+                            # self.get_base_layer().weight.data = weight
+                        else:
+                            # self.lora_S[adapter_name].weight.data = Sr.clone().detach().requires_grad_(True)
+                            self.lora_S[adapter_name].set_s(Sr,learn_direction=False)
+                            nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+
+                    else:
+
+                        nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+
+                    # self.lora_A[adapter_name].weight.data = Vr.T.clone().detach().requires_grad_(True)
+                    # self.lora_B[adapter_name].weight.data = Ur.clone().detach().requires_grad_(True)
+                  
+                    # self.lora_A[adapter_name].weight.data = Vr.T
+                    # self.lora_A[adapter_name].requires_grad_(False)
 
             elif init_lora_weights.lower() == "gaussian":
                 nn.init.normal_(self.lora_A[adapter_name].weight, std=1 / self.r[adapter_name])
             else:
                 raise ValueError(f"Unknown initialization {init_lora_weights=}")
-            nn.init.zeros_(self.lora_B[adapter_name].weight)
+            if not use_variant_init_S:
+                nn.init.zeros_(self.lora_B[adapter_name].weight)
         if adapter_name in self.lora_embedding_A.keys():
             # Initialize A to zeros and B the same way as the default for nn.Embedding, see:
             # https://github.com/microsoft/LoRA/blob/4c0333854cb905966f8cc4e9a74068c1e507c7b7/loralib/layers.py#L59-L60
@@ -270,8 +419,11 @@ class LoraLayer(BaseTunerLayer):
 
         lora_A = torch.diag(torch.sqrt(Sr)) @ Uhr
         lora_B = Vr @ torch.diag(torch.sqrt(Sr))
+        # lora_S = torch.diag(Sr)
         self.lora_A[adapter_name].weight.data = lora_A
+        # self.lora_S[adapter_name].weight.data = torch.eye(self.r[adapter_name])
         self.lora_B[adapter_name].weight.data = lora_B
+        # weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_S @ lora_A
         weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
         weight = transpose(weight.to(dtype), self.fan_in_fan_out)
         self.get_base_layer().weight.data = weight
@@ -403,13 +555,14 @@ class LoraLayer(BaseTunerLayer):
 
             lora_A = self.lora_A[active_adapter]
             lora_B = self.lora_B[active_adapter]
+            lora_S = self.lora_S[active_adapter]
             dropout = self.lora_dropout[active_adapter]
             scaling = self.scaling[active_adapter]
 
             # getting the sub-batch, passing it to LoRA layers and updating the corresponding indices of the linear
             # layer output
             sub_batch = x[sub_batch_indices_list[i]].to(lora_A.weight.dtype)
-            lora_output = lora_B(lora_A(dropout(sub_batch))) * scaling
+            lora_output = lora_B(lora_S(lora_A(dropout(sub_batch)))) * scaling
             result[sub_batch_indices_list[i]] += lora_output.to(torch_result_dtype)
 
         return result
@@ -572,12 +725,14 @@ class Linear(nn.Module, LoraLayer):
 
         weight_A = self.lora_A[adapter].weight
         weight_B = self.lora_B[adapter].weight
-        weight_V = self.lora_V[adapter].weight
+        weight_S = self.lora_S[adapter].weight
+        # weight_V = self.lora_V[adapter].weight
 
         if cast_to_fp32:
             weight_A = weight_A.float()
             weight_B = weight_B.float()
-            weight_V = weight_V.float()
+            weight_S = weight_S.float()
+            # weight_V = weight_V.float()
 
         output_tensor = transpose(weight_B @ weight_A, self.fan_in_fan_out) * self.scaling[adapter]
 
@@ -592,31 +747,49 @@ class Linear(nn.Module, LoraLayer):
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         self._check_forward_args(x, *args, **kwargs)
-        adapter_names = kwargs.pop("adapter_names", None)
 
+        adapter_names = kwargs.pop("adapter_names", None)
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
             result = self.base_layer(x, *args, **kwargs)
+            print(args,kwargs)
         elif adapter_names is not None:
             result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else: #goes here
-            result = self.base_layer(x, *args, **kwargs)
-            torch_result_dtype = result.dtype
+
+       
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.lora_A.keys():
                     continue
                 lora_A = self.lora_A[active_adapter]
                 lora_B = self.lora_B[active_adapter]
-                lora_V = self.lora_V[active_adapter]
+                if use_S:
+                    lora_S = self.lora_S[active_adapter]
+                    # lora_S.weight.data = torch.diag(torch.diagonal(lora_S.weight.data))
+                # lora_V = self.lora_V[active_adapter]
+                # Us_r = self.US_r[active_adapter]
+                
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
                 x = x.to(lora_A.weight.dtype)
+                diact = DiagonalActivation()
+                
+                # print(args,kwargs)
+                result = self.base_layer(x, *args, **kwargs)
+                #result = Us_r(lora_V(x,*args, **kwargs),*args,**kwargs) + self.bias
+                # result = Us_r(lora_V(x,*args, **kwargs),*args,**kwargs) + self.bias
+                torch_result_dtype = result.dtype
 
                 if not self.use_dora[active_adapter]:
-                    result = result + lora_B(lora_A(dropout(x))) * scaling
+                    # result = result + lora_B(lora_S(lora_A(dropout(x)))) * scaling
+                    if use_S:
+                        result = result + lora_B(lora_S(lora_A(dropout(x)))) * scaling
+                    else:
+                        result = result + lora_B(lora_A(dropout(x))) * scaling
+                    # result = result + lora_B(nn.functional.relu(lora_S(lora_A(dropout(x))))) * scaling
                 else:
                     if isinstance(dropout, nn.Identity) or not self.training:
                         base_result = result
