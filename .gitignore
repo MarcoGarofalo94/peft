@@ -142,3 +142,4 @@ dmypy.json
 
 # More test things
 wandb
+*.pth
