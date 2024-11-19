@@ -80,7 +80,7 @@ class SLayer(nn.Module):
             self.register_buffer('direction', self.init_direction)
             
         if learn_magnitude:
-            self.magnitude = nn.Parameter(torch.tensor([self.init_magnitude]))
+            self.weight = nn.Parameter(torch.tensor([self.init_magnitude]))
         else:
             self.register_buffer('magnitude', torch.tensor([self.init_magnitude]))
         
@@ -103,7 +103,7 @@ class SLayer(nn.Module):
             
         # Normalize direction and scale by magnitude
         normalized_direction = F.normalize(self.direction, dim=0)
-        diagonal = normalized_direction * self.magnitude
+        diagonal = normalized_direction * self.weight
         
         # Create diagonal matrix for transformation
         diag_matrix = torch.diag(diagonal)
@@ -116,7 +116,7 @@ class SLayer(nn.Module):
         Property to get current diagonal matrix.
         """
         normalized_direction = F.normalize(self.direction, dim=0)
-        diagonal = normalized_direction * self.magnitude
+        diagonal = normalized_direction * self.weight
         return torch.diag(diagonal)
     
     @property
@@ -125,12 +125,12 @@ class SLayer(nn.Module):
         Property to get current diagonal vector.
         """
         normalized_direction = F.normalize(self.direction, dim=0)
-        return normalized_direction * self.magnitude
+        return normalized_direction * self.weight
 
 class LoraLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     if use_S:
-        adapter_layer_names = ("lora_S","lora_A","lora_B", "lora_embedding_A", "lora_embedding_B",) #V
+        adapter_layer_names = ("lora_S","lora_B", "lora_embedding_A", "lora_embedding_B",) #V
     else:
         adapter_layer_names = ("lora_A","lora_B", "lora_embedding_A", "lora_embedding_B",) #V
 
@@ -144,6 +144,8 @@ class LoraLayer(BaseTunerLayer):
 
     def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, **kwargs) -> None:
         self.base_layer = base_layer
+        ##residual should be a tensor same dimension of base_layer.weight but not trainable
+        self.lora_residual = nn.Parameter(torch.zeros_like(base_layer.weight), requires_grad=False)
         self.r = {}
         self.lora_alpha = {}
         self.scaling = {}
@@ -235,6 +237,7 @@ class LoraLayer(BaseTunerLayer):
         # self.lora_V[adapter_name] = nn.Linear(self.in_features, r, bias=False) # V
         if use_S:
             # self.lora_S[adapter_name] = nn.Linear(r, r, bias=False) # V
+            self.lora_A[adapter_name].weight.requires_grad_(False)
             self.lora_S[adapter_name] = SLayer()
 
         #Frozen params
@@ -313,6 +316,8 @@ class LoraLayer(BaseTunerLayer):
                             # self.lora_S[adapter_name].weight.data = Sr.clone().detach().requires_grad_(True)
                             self.lora_S[adapter_name].set_s(Sr,learn_direction=False)
                             nn.init.kaiming_uniform_(self.lora_A[adapter_name].weight, a=math.sqrt(5))
+                            self.lora_A[adapter_name].weight.data = Vr.T.clone().detach().requires_grad_(True)
+                            self.lora_A[adapter_name].requires_grad_(False)
 
                     else:
 
@@ -775,10 +780,14 @@ class Linear(nn.Module, LoraLayer):
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
                 x = x.to(lora_A.weight.dtype)
-                diact = DiagonalActivation()
+                # diact = DiagonalActivation()
                 
                 # print(args,kwargs)
-                result = self.base_layer(x, *args, **kwargs)
+                from copy import deepcopy
+                base_layer_copy = deepcopy(self.base_layer)
+                base_layer_copy.weight -= self.lora_residual.data
+                result = base_layer_copy(x, *args, **kwargs)
+                # result = self.base_layer(x, *args, **kwargs)
                 #result = Us_r(lora_V(x,*args, **kwargs),*args,**kwargs) + self.bias
                 # result = Us_r(lora_V(x,*args, **kwargs),*args,**kwargs) + self.bias
                 torch_result_dtype = result.dtype
